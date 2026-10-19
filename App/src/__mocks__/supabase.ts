@@ -16,4 +16,5 @@ export const supabase = {
     verifyOtp: jest.fn().mockResolvedValue({ data: { user: null }, error: null }),
     signOut: jest.fn().mockResolvedValue({ error: null }),
   },
+  removeAllChannels: jest.fn().mockResolvedValue(undefined),
 };

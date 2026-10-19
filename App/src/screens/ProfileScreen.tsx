@@ -8,14 +8,13 @@ import {
   TouchableOpacity,
   Switch,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS, SPACING, FONT_SIZES, BORDER_RADIUS, SHADOWS, createThemedStyles, useTheme } from '../constants/theme';
 import { Screen, Section, ActionRow } from '../components';
 import { ProfileHeader, ProfileQRCode } from '../components/profile';
 import { useProfileData } from '../hooks/useProfileData';
 import { AlertManager } from '../utils/alert';
-import { clearSessionPin } from '../services/wallet';
+import { signOut } from '../services/auth';
 interface ProfileScreenProps {
   navigation: any;
 }
@@ -43,16 +42,17 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
           text: 'Sign Out',
           style: 'destructive',
           onPress: async () => {
-            await AsyncStorage.removeItem('auth_token');
-            await AsyncStorage.removeItem('phone_verified');
-            await AsyncStorage.removeItem('phone_number');
-            await AsyncStorage.removeItem('user_phone');
-            await AsyncStorage.removeItem('email_verified');
-            await AsyncStorage.removeItem('user_email');
-            clearSessionPin();
-            AlertManager.alert('Signed Out', 'You have been signed out successfully.', [
-              { text: 'OK', onPress: () => navigation.replace('Splash') },
-            ]);
+            try {
+              await signOut();
+              AlertManager.alert('Signed Out', 'You have been signed out successfully.', [
+                {
+                  text: 'OK',
+                  onPress: () => navigation.reset({ index: 0, routes: [{ name: 'Splash' }] }),
+                },
+              ]);
+            } catch {
+              AlertManager.alert('Sign Out Failed', 'Please try again.');
+            }
           },
         },
       ]

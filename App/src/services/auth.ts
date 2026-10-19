@@ -2,6 +2,7 @@ import { Logger } from '../utils/logger';
 import { supabase } from './supabase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { clearSessionPin } from './wallet';
+import { stopTransactionPolling } from './transactionMonitor';
 
 // Rate limiting constants
 const MAX_OTP_ATTEMPTS_PER_DAY = 10;
@@ -303,7 +304,9 @@ export async function getRemainingAttempts(): Promise<{
  * Sign out from Supabase
  */
 export async function signOut(): Promise<void> {
-  await supabase.auth.signOut();
+  const { error } = await supabase.auth.signOut();
+  stopTransactionPolling();
+  await supabase.removeAllChannels();
   await AsyncStorage.multiRemove([
     'auth_token',
     // Legacy phone-OTP keys: no longer written, cleared from older installs.
@@ -312,8 +315,16 @@ export async function signOut(): Promise<void> {
     'user_phone',
     'email_verified',
     'user_email',
+    'transactions',
+    'display_name',
+    'cpay_id',
+    'profile_photo',
   ]);
   clearSessionPin();
+
+  if (error) {
+    throw error;
+  }
 }
 
 // Note on session swapping (issue #2 / #32):
