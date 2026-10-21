@@ -1,5 +1,11 @@
 import { Logger } from '../utils/logger';
-import React, { useState } from 'react';
+import { cancelClipboardClear, scheduleClipboardClear } from '../utils/clipboardLifecycle';
+import {
+  enableSecretCaptureProtection,
+  releaseSecretCaptureProtection,
+} from '../utils/secretCaptureLifecycle';
+import { revealSecretWithCaptureProtection } from '../utils/secretExportController';
+import React, { useState, useEffect, useRef } from 'react';
 
 // Security center screen: access protection and risk controls overview.
 import {
@@ -10,6 +16,7 @@ import {
   TouchableOpacity,
   Modal,
   Platform,
+  AppState,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -21,6 +28,7 @@ import {
   getBiometricType,
   enableBiometric,
   getAuthenticatedWallet,
+  getWalletForSecretExport,
 } from '../utils/biometric';
 import {
   clearBiometricBackup,
@@ -45,6 +53,20 @@ interface SecurityCenterScreenProps {
   navigation: any;
 }
 
+/**
+ * Test-only hooks. The reveal and close handlers are driven directly in tests
+ * because a synthetic press on the modal's TouchableOpacity is not reliable in
+ * this Jest setup, and the ordering under test lives inside the handler.
+ * Not referenced by production code paths.
+ */
+export const __testHooks: {
+  triggerReveal: null | ((type: 'private' | 'stellar') => Promise<void>);
+  triggerClose: null | (() => void);
+} = {
+  triggerReveal: null,
+  triggerClose: null,
+};
+
 export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navigation }) => {
   useTheme();
   const [walletAddress, setWalletAddress] = useState('');
@@ -56,13 +78,64 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   const [dailyLimitLabel, setDailyLimitLabel] = useState('');
   const [exportedKey, setExportedKey] = useState<ExportedKey | null>(null);
   const [showExportedKey, setShowExportedKey] = useState(false);
+  // The secret stays masked until capture protection has actually been enabled.
+  // `captureProtectionPending` covers the window where the native call is still
+  // in flight, so plaintext is never rendered unprotected.
+  const [captureProtectionPending, setCaptureProtectionPending] = useState(false);
   const biometricSavingRef = React.useRef(false);
+  // A revealed secret must not outlive the modal. The timer lives in
+  // clipboardLifecycle so the behaviour is testable without mounting this
+  // screen, and is cancelled on close, background, and unmount.
+  const clearExportedClipboard = () => {
+    void cancelClipboardClear();
+  };
+
+  // While a secret is on screen, screenshots and screen recording must be
+  // blocked. `preventScreenCaptureAsync` is keyed so a late resolution from a
+  // previous open cannot fight the current one, and the release is always
+  // attempted even if the enable failed, so a failed enable never leaves
+  // capture permanently blocked.
+  // Release capture protection whenever the modal closes or the screen
+  // unmounts. Enabling is owned exclusively by the reveal handler, so there is
+  // no double-enable and no window where plaintext renders before protection.
+  // The release is always attempted, so a late-resolving enable cannot leave
+  // capture permanently blocked.
+  const captureGeneration = React.useRef(0);
+
+  React.useEffect(() => {
+    if (!showExportedKey) return undefined;
+
+    const generation = ++captureGeneration.current;
+    return () => {
+      void releaseSecretCaptureProtection();
+      if (generation === captureGeneration.current) {
+        captureGeneration.current += 1;
+      }
+    };
+  }, [showExportedKey]);
 
   useFocusEffect(
     React.useCallback(() => {
       loadSecurity();
     }, [])
   );
+
+  // Leaving the app with a revealed secret on screen is the worst case: the
+  // clipboard may still hold the seed and the app switcher may show the modal.
+  // Close the modal and clear the clipboard on background, and on unmount.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') {
+        setExportedKey(null);
+        setShowExportedKey(false);
+        clearExportedClipboard();
+      }
+    });
+    return () => {
+      sub.remove();
+      clearExportedClipboard();
+    };
+  }, []);
 
   const loadSecurity = async () => {
     const [address, biometricSetting, available, type, backupAvailable, cloudComplete] = await Promise.all([
@@ -198,11 +271,9 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   };
 
   const revealWalletKey = async (type: 'private' | 'stellar') => {
-    const wallet = await getAuthenticatedWallet(
-      'Export Wallet Key',
-      'Enter your C-Pay PIN to export this key',
-      'Export wallet key'
-    );
+    // Secret export must not ride on the signing session cache. Use the
+    // dedicated fresh-authentication path instead of getAuthenticatedWallet().
+    const wallet = await getWalletForSecretExport();
 
     if (!wallet) {
       AlertManager.alert('Authentication Required', 'Unlock your wallet with PIN or biometric to export keys.');
@@ -212,30 +283,64 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
     const isPrivateKey = type === 'private';
     const value = isPrivateKey ? formatRawPrivateKey(wallet.keypair.rawSecretKey()) : wallet.secret;
 
-    setExportedKey({
+    const nextKey = {
       title: isPrivateKey ? 'Private Key' : 'Stellar Secret Key',
       description: isPrivateKey
         ? 'Raw Ed25519 private seed in hex format.'
-        : 'Importable Stellar secret seed. This starts with S.',
+        : 'Importable Stellar secret key. This starts with S.',
       valueLabel: 'Key',
       value,
       warning: isPrivateKey
         ? 'Anyone with this private key can control your C-Pay wallet.'
         : 'Anyone with this Stellar secret key can control your C-Pay wallet.',
+    };
+
+    // Enable capture protection FIRST. Only once it has actually succeeded do
+    // we render the secret unmasked. If it fails, the secret is never handed
+    // back, so there is nothing unmasked to show and the user is told why.
+    setCaptureProtectionPending(true);
+    const outcome = await revealSecretWithCaptureProtection(async () => {
+      const fresh = await getWalletForSecretExport();
+      if (!fresh) return null;
+      return isPrivateKey ? formatRawPrivateKey(fresh.keypair.rawSecretKey()) : fresh.secret;
     });
-    setShowExportedKey(false);
+    setCaptureProtectionPending(false);
+
+    if (outcome.status !== 'revealed') {
+      setExportedKey(null);
+      setShowExportedKey(false);
+      AlertManager.alert(
+        'Cannot Reveal Key',
+        outcome.reason === 'capture-protection-unavailable'
+          ? 'Screen capture could not be blocked on this device, so the key will not be shown. Use a supported device or a screenshot-free path.'
+          : 'Unlock your wallet with PIN or biometric to export keys.'
+      );
+      return;
+    }
+
+    setExportedKey({ ...nextKey, value: outcome.value });
+    setShowExportedKey(true);
   };
+
+  __testHooks.triggerReveal = revealWalletKey;
 
   const handleCopyExportedKey = async () => {
     if (!exportedKey) return;
     await Clipboard.setStringAsync(exportedKey.value);
+    // The clipboard is the weakest link: anything that can read it now holds a
+    // wallet seed. Clear it shortly after the copy instead of leaving it there
+    // indefinitely.
+    scheduleClipboardClear();
     AlertManager.alert('Copied', `${exportedKey.title} copied to clipboard.`, undefined, { type: 'success' });
   };
 
-  const handleCloseExportedKey = () => {
+    const handleCloseExportedKey = () => {
     setExportedKey(null);
     setShowExportedKey(false);
+    clearExportedClipboard();
   };
+
+  __testHooks.triggerClose = handleCloseExportedKey;
 
   const isSecret = exportedKey?.valueLabel === 'Key';
 
@@ -388,8 +493,17 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
             <View style={styles.exportKeyBox}>
               <Text style={styles.exportKeyLabel}>{exportedKey?.valueLabel || 'Value'}</Text>
               <Text style={styles.exportKeyValue} selectable={showExportedKey}>
-                {exportedKey ? (showExportedKey ? exportedKey.value : maskKey(exportedKey.value)) : ''}
+                {exportedKey
+                  ? showExportedKey
+                    ? exportedKey.value
+                    : maskKey(exportedKey.value)
+                  : ''}
               </Text>
+              {captureProtectionPending && (
+                <Text style={styles.captureWarningText}>
+                  Enabling screen-capture protection…
+                </Text>
+              )}
             </View>
 
             <View style={styles.exportActions}>
@@ -449,6 +563,18 @@ const styles = createThemedStyles((COLORS) => ({
     borderWidth: 1,
     borderColor: COLORS.border,
     ...SHADOWS.lg,
+  },
+  captureWarning: {
+    backgroundColor: COLORS.warning + '22',
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.warning,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  captureWarningText: {
+    color: COLORS.warning,
+    fontSize: 12,
+    lineHeight: 17,
   },
   exportModalHeader: {
     flexDirection: 'row',
