@@ -107,6 +107,11 @@ const PREPARED_ACCOUNT_TRANSACTION_TTL_MS = 5 * 60 * 1000;
 const MAX_PREPARED_ACCOUNT_TRANSACTIONS = 10000;
 const preparedAccountTransactions = Object.create(null);
 
+// Hoisted so testHooks can re-export them before module evaluation completes.
+// Separate test-bootstrap fix, unrelated to any security issue.
+const inMemoryPaymentRecords = [];
+const activeAddMoneyUserLocks = Object.create(null);
+
 app.use(helmet());
 app.use(cors({ origin: parseCorsOrigin(process.env.CORS_ORIGIN || '*') }));
 app.use(express.json({ limit: '64kb' }));
@@ -417,10 +422,40 @@ app.post('/payments/submit', requireAuthenticatedUser, requireWalletOwnership(),
 app.get(['/payments/limits', '/limits'], requireAuthenticatedUser, async (req, res) => {
   try {
     const authUid = req.auth && req.auth.sub;
-    const walletAddress = req.query.accountId || (req.resolvedWallets && req.resolvedWallets[0]);
-    const limits = await getPaymentLimitsStatus(authUid, walletAddress);
+    // Never forward a caller-supplied accountId into the query builder. The
+    // only wallet that may narrow the lookup is one the server resolved from
+    // wallet_bindings for this identity; anything else is validated first and
+    // rejected as an unknown address.
+    let walletAddress;
+    // An empty or whitespace accountId means "no wallet named", not "validate
+    // the empty string". Only a non-empty value narrows the lookup.
+    const rawAccountId = typeof req.query.accountId === 'string' ? req.query.accountId.trim() : '';
+    if (rawAccountId) {
+      walletAddress = assertAccountId(rawAccountId, 'accountId');
+    }
+    const binding = await resolveUserWallets(authUid);
+    const authUserWallets = Array.isArray(binding?.wallets) ? binding.wallets : [];
+    if (walletAddress && !authUserWallets.includes(walletAddress)) {
+      return res.status(403).json({
+        error: 'Account does not belong to the authenticated user',
+        code: 'WALLET_OWNERSHIP_DENIED',
+      });
+    }
+    const limits = await getPaymentLimitsStatus(
+      authUid,
+      walletAddress || (authUserWallets && authUserWallets[0]),
+      authUserWallets
+    );
     res.json(limits);
   } catch (error) {
+    // A validation failure (bad accountId) must surface as the caller's 400,
+    // not as a generic 503 that hides the real reason.
+    if (error && error.statusCode && error.statusCode >= 400 && error.statusCode < 500) {
+      return res.status(error.statusCode).json({
+        error: error.message,
+        code: error.code || 'INVALID_ACCOUNT_ID',
+      });
+    }
     console.error('Failed to get payment limits:', error.message);
     res.status(503).json({
       error: 'Payment limits service is temporarily unavailable',
@@ -698,6 +733,7 @@ module.exports = {
       activeAddMoneyUserLocks,
       pruneActiveAddMoneyUserLocks,
       requireAccountPreparationOwnership,
+      verifySupabaseJwt,
     }),
   } : {}),
 };
@@ -716,6 +752,11 @@ function loadConfig() {
   // The legacy faucet is testnet-only and opt-in. It can never run on public network.
   const addMoneyEnabled = networkName === 'testnet' && readBooleanEnv('ENABLE_TESTNET_FAUCET', false);
   const supabaseJwtSecret = process.env.SUPABASE_JWT_SECRET || '';
+  // Optional. When set, the HS256 path also requires the token to carry this
+  // audience and issuer. Left empty, any aud/iss is accepted so existing
+  // deployments keep working.
+  const supabaseJwtAudience = process.env.SUPABASE_JWT_AUDIENCE || '';
+  const supabaseJwtIssuer = process.env.SUPABASE_JWT_ISSUER || '';
   const supabaseUrl = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
   const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
@@ -756,6 +797,8 @@ function loadConfig() {
     lowAssetThreshold: Number(process.env.LOW_USDC_THRESHOLD || 100),
     authRequired,
     supabaseJwtSecret,
+    supabaseJwtAudience,
+    supabaseJwtIssuer,
     supabaseUrl,
     supabaseServiceRoleKey,
     addMoneyEnabled,
@@ -1205,12 +1248,29 @@ async function verifySupabaseJwt(authorizationHeader) {
 
   const claims = JSON.parse(base64UrlDecode(encodedPayload).toString('utf8'));
   const nowSeconds = Math.floor(Date.now() / 1000);
-  if (!claims.sub || (claims.exp && claims.exp <= nowSeconds)) {
+  // A token with no expiry is accepted forever, so a leaked or over-scoped
+  // credential can never be aged out. Require exp explicitly.
+  if (!claims.sub || typeof claims.exp !== 'number') {
+    throw new Error('Expired authentication token');
+  }
+  if (claims.exp <= nowSeconds) {
     throw new Error('Expired authentication token');
   }
 
   if (claims.role && claims.role !== 'authenticated') {
     throw new Error('Authenticated user token required');
+  }
+
+  // Audience and issuer are only meaningful when this relayer is configured to
+  // expect a specific one. When unset, accept any value (backwards compatible);
+  // when set, a mismatch means the token was minted for a different service.
+  const expectedAud = config.supabaseJwtAudience;
+  const expectedIss = config.supabaseJwtIssuer;
+  if (expectedAud && claims.aud !== expectedAud) {
+    throw new Error('Authentication token audience mismatch');
+  }
+  if (expectedIss && claims.iss !== expectedIss) {
+    throw new Error('Authentication token issuer mismatch');
   }
 
   return claims;
@@ -1399,7 +1459,6 @@ async function getAccountStatus(accountId) {
  * - Eviction: Expired entries are pruned on every acquisition; oldest entries evicted if capacity exceeded.
  */
 const MAX_ACTIVE_ADD_MONEY_USER_LOCKS = 1000;
-const activeAddMoneyUserLocks = Object.create(null);
 
 function pruneActiveAddMoneyUserLocks(now = Date.now()) {
   for (const [key, expiry] of Object.entries(activeAddMoneyUserLocks)) {
@@ -1754,12 +1813,13 @@ async function setIdempotencyResponse(key, response, ttlMs) {
   }
 }
 
-const inMemoryPaymentRecords = [];
-
-async function getPaymentRecords(accountId, authUserId, sinceIso) {
+async function getPaymentRecords(accountId, authUserId, sinceIso, authUserWallets = []) {
   if (!isSupabasePersistenceEnabled()) {
+    const ownWallets = new Set(authUserWallets || []);
+    if (accountId) ownWallets.add(accountId);
     return inMemoryPaymentRecords.filter(r => {
-      const matchUser = (authUserId && r.auth_user_id === authUserId) || (accountId && r.wallet_address === accountId);
+      const matchUser = (authUserId && r.auth_user_id === authUserId)
+        || (!r.auth_user_id && ownWallets.has(r.wallet_address));
       const matchTime = !sinceIso || new Date(r.created_at) >= new Date(sinceIso);
       return matchUser && matchTime;
     });
@@ -1767,9 +1827,36 @@ async function getPaymentRecords(accountId, authUserId, sinceIso) {
 
   let filter;
   if (authUserId) {
-    filter = accountId
-      ? `or=(auth_user_id.eq.${encodeURIComponent(authUserId)},wallet_address.eq.${encodeURIComponent(accountId)})`
-      : `auth_user_id=eq.${encodeURIComponent(authUserId)}`;
+    // Never build an OR over a caller-supplied wallet: that lets one identity
+    // read another's rows. Scope by identity, and only narrow by wallet when
+    // the caller's binding to it has been confirmed server-side.
+    //
+    // Pre-migration rows carry auth_user_id IS NULL and only a wallet_address.
+    // They belong to whoever holds the binding, so they are matched through the
+    // server-resolved wallet list rather than dropped from the quota.
+    const bound = (authUserWallets || []).filter(Boolean);
+    if (accountId && bound.length === 0) {
+      // A named wallet the caller has no binding for must not silently widen
+      // into "all wallets". Treat it as unknown, which the route rejects.
+      return [];
+    }
+    if (accountId && !bound.includes(accountId)) {
+      return [];
+    }
+    const legacyWallet = accountId || bound[0];
+    const legacyDisjunct = legacyWallet
+      ? `and(auth_user_id.is.null,wallet_address.eq.${encodeURIComponent(legacyWallet)})`
+      : null;
+    if (legacyDisjunct) {
+      filter = `or=(auth_user_id.eq.${encodeURIComponent(authUserId)},${legacyDisjunct})`;
+    } else if (bound.length > 0) {
+      const walletOr = bound
+        .map(w => `wallet_address.eq.${encodeURIComponent(w)}`)
+        .join(',');
+      filter = `or=(auth_user_id.eq.${encodeURIComponent(authUserId)},and(auth_user_id.is.null,or=(${walletOr})))`;
+    } else {
+      filter = `auth_user_id=eq.${encodeURIComponent(authUserId)}`;
+    }
   } else {
     filter = `wallet_address=eq.${encodeURIComponent(accountId)}`;
   }
@@ -1838,7 +1925,19 @@ async function checkPaymentLimits(walletAddress, authUserId, amountStr) {
 
   let records;
   try {
-    records = await getPaymentRecords(walletAddress, authUserId, oneDayAgo);
+    // Resolve the caller's bindings here too, so the same server-authoritative
+    // wallet list governs both the route and the internal limit check. Without
+    // it, pre-migration rows (auth_user_id IS NULL) would be dropped from the
+    // quota on this path while still counting on the route path.
+    const binding = await resolveUserWallets(authUserId);
+    const authUserWallets = Array.isArray(binding?.wallets) ? binding.wallets : [];
+    // When persistence is off there is no binding table to consult, so the
+    // wallet the caller named is the only identity anchor available. Keep it in
+    // the list rather than letting the filter drop every row.
+    if (!isSupabasePersistenceEnabled() && walletAddress && !authUserWallets.includes(walletAddress)) {
+      authUserWallets.push(walletAddress);
+    }
+    records = await getPaymentRecords(walletAddress, authUserId, oneDayAgo, authUserWallets);
   } catch (err) {
     const error = new Error('Payment limits service is temporarily unavailable');
     error.statusCode = 503;
@@ -1890,9 +1989,9 @@ async function checkPaymentLimits(walletAddress, authUserId, amountStr) {
   return { allowed: true };
 }
 
-async function getPaymentLimitsStatus(authUserId, walletAddress) {
+async function getPaymentLimitsStatus(authUserId, walletAddress, authUserWallets = []) {
   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const records = await getPaymentRecords(walletAddress, authUserId, oneDayAgo);
+  const records = await getPaymentRecords(walletAddress, authUserId, oneDayAgo, authUserWallets);
 
   const transactionsToday = records.length;
   const amountToday = records.reduce((sum, r) => sum + Number(r.amount || 0), 0);
