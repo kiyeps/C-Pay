@@ -47,6 +47,7 @@ const quoteEngine = createQuoteEngine({
   feeBps: config.quoteFeeBps,
   spreadBps: config.quoteSpreadBps,
   ttlSeconds: config.quoteTtlSeconds,
+  quoteSignatureSecret: config.quoteSignatureSecret || null,
 });
 const server = new StellarSdk.Horizon.Server(config.horizonUrl, {
   allowHttp: config.horizonUrl.startsWith('http://'),
@@ -107,6 +108,11 @@ const PREPARED_ACCOUNT_TRANSACTION_TTL_MS = 5 * 60 * 1000;
 const MAX_PREPARED_ACCOUNT_TRANSACTIONS = 10000;
 const preparedAccountTransactions = Object.create(null);
 
+// Hoisted so testHooks can re-export them before module evaluation completes.
+// Separate test-bootstrap fix, unrelated to the quote security issue.
+const inMemoryPaymentRecords = [];
+const activeAddMoneyUserLocks = Object.create(null);
+
 app.use(helmet());
 app.use(cors({ origin: parseCorsOrigin(process.env.CORS_ORIGIN || '*') }));
 app.use(express.json({ limit: '64kb' }));
@@ -138,11 +144,22 @@ app.get('/health', (_req, res) => {
 });
 
 app.post('/quotes', requireAuthenticatedUser, async (req, res) => {
+  // A quote is a promise to one caller. Bind the authenticated identity at
+  // creation time so validation can refuse a quote re-pointed at another user.
+  // Without a signing secret the engine cannot prove authorship, so quote
+  // creation fails closed rather than emitting an unverifiable quote.
+  if (!config.quoteSignatureSecret) {
+    return res.status(503).json({
+      error: 'Quote signing is not configured',
+      code: 'QUOTE_SIGNING_NOT_CONFIGURED',
+    });
+  }
   try {
     const quote = await quoteEngine.createQuote({
       sendAmount: req.body.sendAmount,
       sendCurrency: req.body.sendCurrency,
       receiveCurrency: req.body.receiveCurrency,
+      ownerId: req.auth.sub,
     });
     res.status(201).json(quote);
   } catch (error) {
@@ -153,9 +170,12 @@ app.post('/quotes', requireAuthenticatedUser, async (req, res) => {
 
 app.post('/quotes/validate', requireAuthenticatedUser, (req, res) => {
   try {
-    res.json(quoteEngine.assertFresh(req.body));
+    // Verify owner and signature for the caller making the request. A quote
+    // minted for one identity must not validate for another.
+    res.json(quoteEngine.assertFreshForOwner(req.body, req.auth.sub));
   } catch (error) {
-    res.status(410).json({ error: error.message, code: error.code || 'QUOTE_EXPIRED' });
+    const status = error.code === 'QUOTE_SIGNING_NOT_CONFIGURED' ? 503 : 410;
+    res.status(status).json({ error: error.message, code: error.code || 'QUOTE_EXPIRED' });
   }
 });
 
@@ -767,6 +787,7 @@ function loadConfig() {
     quoteFeeBps: Number(process.env.QUOTE_FEE_BPS || 175),
     quoteSpreadBps: Number(process.env.QUOTE_SPREAD_BPS || 0),
     quoteTtlSeconds: Number(process.env.QUOTE_TTL_SECONDS || 60),
+    quoteSignatureSecret: process.env.QUOTE_SIGNATURE_SECRET || '',
   };
 }
 
@@ -1399,7 +1420,6 @@ async function getAccountStatus(accountId) {
  * - Eviction: Expired entries are pruned on every acquisition; oldest entries evicted if capacity exceeded.
  */
 const MAX_ACTIVE_ADD_MONEY_USER_LOCKS = 1000;
-const activeAddMoneyUserLocks = Object.create(null);
 
 function pruneActiveAddMoneyUserLocks(now = Date.now()) {
   for (const [key, expiry] of Object.entries(activeAddMoneyUserLocks)) {
@@ -1753,8 +1773,6 @@ async function setIdempotencyResponse(key, response, ttlMs) {
     console.warn('Idempotency update failed:', error.message);
   }
 }
-
-const inMemoryPaymentRecords = [];
 
 async function getPaymentRecords(accountId, authUserId, sinceIso) {
   if (!isSupabasePersistenceEnabled()) {
