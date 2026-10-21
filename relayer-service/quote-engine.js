@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 const RATE_SCALE = 100000000n;
 
 /**
@@ -13,6 +15,7 @@ function createQuoteEngine({
   spreadBps = 0,
   ttlSeconds = 60,
   now = () => Date.now(),
+  quoteSignatureSecret = null,
 } = {}) {
   if (!rateProvider || typeof rateProvider.getRate !== 'function') {
     throw new TypeError('rateProvider.getRate must be provided');
@@ -25,7 +28,7 @@ function createQuoteEngine({
   }
 
   return {
-    async createQuote({ sendAmount, sendCurrency, receiveCurrency }) {
+    async createQuote({ sendAmount, sendCurrency, receiveCurrency, ownerId }) {
       const from = assertCurrency(sendCurrency, 'sendCurrency');
       const to = assertCurrency(receiveCurrency, 'receiveCurrency');
       const amountMinor = parseMinorAmount(sendAmount);
@@ -38,7 +41,7 @@ function createQuoteEngine({
       const feeMinor = (amountMinor * BigInt(normalizedFeeBps) + 9999n) / 10000n;
       const expiresAt = new Date(now() + ttlSeconds * 1000).toISOString();
 
-      return {
+      const quote = {
         sendAmount: formatMinor(amountMinor),
         sendCurrency: from,
         amountDebited: formatMinor(amountMinor + feeMinor),
@@ -50,10 +53,54 @@ function createQuoteEngine({
         receiveCurrency: to,
         expiresAt,
         rateMovementPolicy: 'The quoted recipient amount is fixed until expiresAt; settlement must reject expired quotes and obtain a new quote.',
+        // Bind the quote to the identity that requested it. A quote is only
+        // meaningful as a promise to one caller, so a quote minted for user A
+        // must not validate for user B.
+        ownerId: ownerId || null,
       };
+
+      // Sign only when a secret is configured. Without a secret the engine
+      // cannot prove authorship, so validation refuses signed-required mode
+      // rather than silently trusting client-supplied fields.
+      if (quoteSignatureSecret) {
+        quote.signature = signQuotePayload(quote, quoteSignatureSecret);
+      }
+      return quote;
+    },
+
+    assertFreshForOwner(quote, ownerId) {
+      if (!quote || !quote.expiresAt || new Date(quote.expiresAt).getTime() <= now()) {
+        const error = new Error('Quote has expired; request a new quote');
+        error.code = 'QUOTE_EXPIRED';
+        throw error;
+      }
+
+      if (!quoteSignatureSecret) {
+        // No secret configured: the engine cannot distinguish a genuine quote
+        // from a hand-built payload. Fail closed instead of accepting anything.
+        const error = new Error('Quote signing is not configured');
+        error.code = 'QUOTE_SIGNING_NOT_CONFIGURED';
+        throw error;
+      }
+
+      if (quote.ownerId !== ownerId) {
+        const error = new Error('Quote does not belong to the authenticated user');
+        error.code = 'QUOTE_OWNER_MISMATCH';
+        throw error;
+      }
+
+      const expected = signQuotePayload(quote, quoteSignatureSecret);
+      if (quote.signature !== expected) {
+        const error = new Error('Quote signature does not match its contents');
+        error.code = 'QUOTE_SIGNATURE_MISMATCH';
+        throw error;
+      }
+
+      return quote;
     },
 
     assertFresh(quote) {
+      // Backward-compatible alias: same freshness rule, no signature check.
       if (!quote || !quote.expiresAt || new Date(quote.expiresAt).getTime() <= now()) {
         const error = new Error('Quote has expired; request a new quote');
         error.code = 'QUOTE_EXPIRED';
@@ -62,6 +109,35 @@ function createQuoteEngine({
       return quote;
     },
   };
+}
+
+/**
+ * Deterministic HMAC over the canonical financial fields of a quote.
+ *
+ * Every field a settlement would act on is included, so changing any one of
+ * them invalidates the signature. The signature field itself is excluded, and
+ * the field list is written out explicitly rather than derived from the object,
+ * so adding a new field to the quote cannot silently bypass the signature.
+ */
+const QUOTE_SIGNED_FIELDS = [
+  'sendAmount',
+  'sendCurrency',
+  'receiveCurrency',
+  'amountDebited',
+  'fee',
+  'feeBps',
+  'fxRate',
+  'spreadBps',
+  'recipientAmount',
+  'expiresAt',
+  'ownerId',
+];
+
+function signQuotePayload(quote, secret) {
+  const canonical = QUOTE_SIGNED_FIELDS
+    .map((field) => `${field}=${quote[field] === undefined || quote[field] === null ? '' : String(quote[field])}`)
+    .join('\n');
+  return crypto.createHmac('sha256', secret).update(canonical).digest('hex');
 }
 
 function assertBasisPoints(value, name) {
