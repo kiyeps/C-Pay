@@ -85,7 +85,6 @@ type RestoreWalletRouteParams = {
   verifiedEmail?: string;
   walletAddress: string;
   displayName?: string | null;
-  cpayId?: string | null;
   profilePhotoUrl?: string | null;
   accountSwitch?: boolean;
 };
@@ -105,7 +104,6 @@ export const RestoreWalletScreen: React.FC<RestoreWalletScreenProps> = ({ naviga
     verifiedEmail,
     walletAddress,
     displayName,
-    cpayId,
     profilePhotoUrl,
     accountSwitch,
   } = route.params;
@@ -279,12 +277,12 @@ export const RestoreWalletScreen: React.FC<RestoreWalletScreenProps> = ({ naviga
 
     if (verifiedEmail) writes.push(['email_verified', 'true'], ['user_email', verifiedEmail]);
     if (displayName) writes.push(['display_name', displayName]);
-    if (cpayId) writes.push(['cpay_id', cpayId]);
     if (profilePhotoUrl) writes.push(['profile_photo', profilePhotoUrl]);
 
     const { data: userData } = await supabase.auth.getUser();
     if (userData.user?.id) writes.push([WALLET_AUTH_USER_ID_KEY, userData.user.id]);
 
+    await AsyncStorage.removeItem('cpay_id');
     await AsyncStorage.multiSet(writes);
   };
 

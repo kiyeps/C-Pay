@@ -19,8 +19,13 @@ export const useProfileData = () => {
   };
 
   const loadCPayId = async () => {
-    const id = await getCurrentUserCPayId();
-    if (id) setCpayId(id);
+    try {
+      const id = await getCurrentUserCPayId();
+      setCpayId(id || '');
+    } catch (error) {
+      Logger.error('Error loading C-Pay ID:', error);
+      setCpayId('');
+    }
   };
 
   const loadDisplayName = async () => {

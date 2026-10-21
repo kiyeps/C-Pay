@@ -22,7 +22,7 @@ import { PINInput } from '../components/PINInput';
 import { Screen } from '../components';
 import { COLORS, SPACING, TYPOGRAPHY, createThemedStyles, useTheme } from '../constants/theme';
 import { AlertManager } from '../utils/alert';
-import { formatWalletFingerprint, generateCPayId } from '../utils/cpayId';
+import { formatWalletFingerprint, getCPayIdByWallet } from '../utils/cpayId';
 
 const FONT_SIZES = TYPOGRAPHY.sizes;
 
@@ -154,10 +154,8 @@ export const ForgotPINScreen: React.FC<ForgotPINScreenProps> = ({ navigation }) 
         const walletAddress = await recreateWalletFromSecret(recoveredSecret, newPin);
         cachePinForSession(newPin);
 
-        const email = await AsyncStorage.getItem('user_email');
-        const displayId = email
-          ? generateCPayId(email, walletAddress)
-          : formatWalletFingerprint(walletAddress);
+        const displayId =
+          await getCPayIdByWallet(walletAddress) || formatWalletFingerprint(walletAddress);
 
         AlertManager.alert(
           'PIN Reset Successful',
