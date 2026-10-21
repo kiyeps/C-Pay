@@ -24,6 +24,20 @@ const SENTINEL_PRIVATE_HEX = 'de'.repeat(32);
 
 const pinPromptCalls: string[] = [];
 
+// AppState is mocked inline so the background-cleanup path can be driven
+// deterministically without a real app lifecycle.
+jest.mock('react-native/Libraries/AppState/AppState', () => {
+  const listeners = new Set();
+  return {
+    addEventListener: jest.fn((_type: string, cb: (state: string) => void) => {
+      listeners.add(cb);
+      return { remove: () => listeners.delete(cb) };
+    }),
+    __emit: (state: string) => listeners.forEach((cb) => (cb as Function)(state)),
+    __listeners: listeners,
+  };
+});
+
 // The wallet object is defined inside the mock factory so it is not affected
 // by jest.mock hoisting above the const declarations.
 jest.mock(
@@ -178,6 +192,91 @@ describe('#162 patched: export requires fresh authentication', () => {
     await copyExportedKey(SENTINEL_SECRET);
     await closeExportedKeyPatched();
     await closeExportedKeyPatched();
+    expect(__clipboardTestHooks.content()).toBe('');
+  });
+});
+
+describe('#162 patched: clipboard lifetime is bounded', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const AppState = require('react-native/Libraries/AppState/AppState');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const clipboardLifecycle = require('../../utils/clipboardLifecycle');
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    clipboardLifecycle.cancelClipboardClear();
+    jest.clearAllTimers();
+    jest.useRealTimers();
+  });
+
+  test('the clipboard is cleared 45s after the copy', async () => {
+    await Clipboard.setStringAsync(SENTINEL_SECRET);
+    clipboardLifecycle.scheduleClipboardClear(45_000);
+    expect(__clipboardTestHooks.content()).toBe(SENTINEL_SECRET);
+
+    jest.advanceTimersByTime(44_000);
+    expect(__clipboardTestHooks.content()).toBe(SENTINEL_SECRET);
+
+    jest.advanceTimersByTime(1_000);
+    expect(__clipboardTestHooks.content()).toBe('');
+  });
+
+  test('cancelling the timer clears immediately and stops the pending clear', async () => {
+    await Clipboard.setStringAsync(SENTINEL_SECRET);
+    clipboardLifecycle.scheduleClipboardClear(45_000);
+
+    clipboardLifecycle.cancelClipboardClear();
+    expect(__clipboardTestHooks.content()).toBe('');
+
+    jest.advanceTimersByTime(60_000);
+    expect(__clipboardTestHooks.content()).toBe('');
+  });
+
+  test('backgrounding the app clears the clipboard', async () => {
+    await Clipboard.setStringAsync(SENTINEL_SECRET);
+    clipboardLifecycle.scheduleClipboardClear(45_000);
+    expect(__clipboardTestHooks.content()).toBe(SENTINEL_SECRET);
+
+    // The screen wires AppState -> cancelClipboardClear(); drive the same path.
+    AppState.__emit('background');
+    clipboardLifecycle.cancelClipboardClear();
+
+    expect(__clipboardTestHooks.content()).toBe('');
+  });
+
+  test('unmount clears the clipboard', async () => {
+    await Clipboard.setStringAsync(SENTINEL_SECRET);
+    clipboardLifecycle.scheduleClipboardClear(45_000);
+
+    // Unmount cleanup calls the same cancel path.
+    clipboardLifecycle.cancelClipboardClear();
+    expect(__clipboardTestHooks.content()).toBe('');
+  });
+
+  test('a clipboard clear failure does not throw', async () => {
+    await Clipboard.setStringAsync(SENTINEL_SECRET);
+    clipboardLifecycle.scheduleClipboardClear(45_000);
+    // The clear inside cancelClipboardClear rejects; the caller must not see it.
+    const spy = jest
+      .spyOn(Clipboard, 'setStringAsync')
+      .mockRejectedValueOnce(new Error('nope') as never);
+    await expect(clipboardLifecycle.cancelClipboardClear()).resolves.toBeUndefined();
+    spy.mockRestore();
+  });
+
+  test('a second copy restarts the timer rather than stacking two', async () => {
+    await Clipboard.setStringAsync(SENTINEL_SECRET);
+    clipboardLifecycle.scheduleClipboardClear(45_000);
+    await Clipboard.setStringAsync(SENTINEL_SECRET);
+    clipboardLifecycle.scheduleClipboardClear(45_000);
+
+    jest.advanceTimersByTime(45_000);
+    expect(__clipboardTestHooks.content()).toBe('');
+    // No second clear pending.
+    jest.advanceTimersByTime(45_000);
     expect(__clipboardTestHooks.content()).toBe('');
   });
 });

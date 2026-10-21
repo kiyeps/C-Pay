@@ -1,5 +1,6 @@
 import { Logger } from '../utils/logger';
-import React, { useState } from 'react';
+import { cancelClipboardClear, scheduleClipboardClear } from '../utils/clipboardLifecycle';
+import React, { useState, useEffect, useRef } from 'react';
 
 // Security center screen: access protection and risk controls overview.
 import {
@@ -10,6 +11,7 @@ import {
   TouchableOpacity,
   Modal,
   Platform,
+  AppState,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -58,12 +60,35 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   const [exportedKey, setExportedKey] = useState<ExportedKey | null>(null);
   const [showExportedKey, setShowExportedKey] = useState(false);
   const biometricSavingRef = React.useRef(false);
+  // A revealed secret must not outlive the modal. The timer lives in
+  // clipboardLifecycle so the behaviour is testable without mounting this
+  // screen, and is cancelled on close, background, and unmount.
+  const clearExportedClipboard = () => {
+    void cancelClipboardClear();
+  };
 
   useFocusEffect(
     React.useCallback(() => {
       loadSecurity();
     }, [])
   );
+
+  // Leaving the app with a revealed secret on screen is the worst case: the
+  // clipboard may still hold the seed and the app switcher may show the modal.
+  // Close the modal and clear the clipboard on background, and on unmount.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') {
+        setExportedKey(null);
+        setShowExportedKey(false);
+        clearExportedClipboard();
+      }
+    });
+    return () => {
+      sub.remove();
+      clearExportedClipboard();
+    };
+  }, []);
 
   const loadSecurity = async () => {
     const [address, biometricSetting, available, type, backupAvailable, cloudComplete] = await Promise.all([
@@ -228,17 +253,17 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   const handleCopyExportedKey = async () => {
     if (!exportedKey) return;
     await Clipboard.setStringAsync(exportedKey.value);
+    // The clipboard is the weakest link: anything that can read it now holds a
+    // wallet seed. Clear it shortly after the copy instead of leaving it there
+    // indefinitely.
+    scheduleClipboardClear();
     AlertManager.alert('Copied', `${exportedKey.title} copied to clipboard.`, undefined, { type: 'success' });
   };
 
   const handleCloseExportedKey = () => {
     setExportedKey(null);
     setShowExportedKey(false);
-    // The secret that was just on screen must not outlive the modal. Clearing
-    // React state alone leaves the seed readable by anything that can see the
-    // clipboard, so clear the clipboard too. Best-effort: some platforms do not
-    // expose a reliable clear, and a failure here must not break the close.
-    Clipboard.setStringAsync('').catch(() => {});
+    clearExportedClipboard();
   };
 
   const isSecret = exportedKey?.valueLabel === 'Key';
