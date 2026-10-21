@@ -177,8 +177,6 @@ async function bootRelayer() {
     SUPABASE_URL: `http://127.0.0.1:${mockSupabasePort}`,
     SUPABASE_SERVICE_ROLE_KEY: 'fixture-role-key',
     SUPABASE_JWT_SECRET: 'fixture-jwt-secret',
-    SUPABASE_JWT_AUDIENCE: 'authenticated',
-    SUPABASE_JWT_ISSUER: 'x',
     STELLAR_NETWORK: 'testnet',
     RELAYER_AUTH_REQUIRED: 'true',
     LEDGER_INGEST_ENABLED: 'false',
