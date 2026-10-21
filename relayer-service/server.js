@@ -107,6 +107,10 @@ const PREPARED_ACCOUNT_TRANSACTION_TTL_MS = 5 * 60 * 1000;
 const MAX_PREPARED_ACCOUNT_TRANSACTIONS = 10000;
 const preparedAccountTransactions = Object.create(null);
 
+// Hoisted so testHooks can re-export them before module evaluation completes.
+const inMemoryPaymentRecords = [];
+const activeAddMoneyUserLocks = Object.create(null);
+
 app.use(helmet());
 app.use(cors({ origin: parseCorsOrigin(process.env.CORS_ORIGIN || '*') }));
 app.use(express.json({ limit: '64kb' }));
@@ -698,6 +702,7 @@ module.exports = {
       activeAddMoneyUserLocks,
       pruneActiveAddMoneyUserLocks,
       requireAccountPreparationOwnership,
+      verifySupabaseJwt,
     }),
   } : {}),
 };
@@ -716,6 +721,11 @@ function loadConfig() {
   // The legacy faucet is testnet-only and opt-in. It can never run on public network.
   const addMoneyEnabled = networkName === 'testnet' && readBooleanEnv('ENABLE_TESTNET_FAUCET', false);
   const supabaseJwtSecret = process.env.SUPABASE_JWT_SECRET || '';
+  // Optional. When set, the HS256 path also requires the token to carry this
+  // audience and issuer. Left empty, any aud/iss is accepted so existing
+  // deployments keep working.
+  const supabaseJwtAudience = process.env.SUPABASE_JWT_AUDIENCE || '';
+  const supabaseJwtIssuer = process.env.SUPABASE_JWT_ISSUER || '';
   const supabaseUrl = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
   const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
@@ -756,6 +766,8 @@ function loadConfig() {
     lowAssetThreshold: Number(process.env.LOW_USDC_THRESHOLD || 100),
     authRequired,
     supabaseJwtSecret,
+    supabaseJwtAudience,
+    supabaseJwtIssuer,
     supabaseUrl,
     supabaseServiceRoleKey,
     addMoneyEnabled,
@@ -1205,12 +1217,29 @@ async function verifySupabaseJwt(authorizationHeader) {
 
   const claims = JSON.parse(base64UrlDecode(encodedPayload).toString('utf8'));
   const nowSeconds = Math.floor(Date.now() / 1000);
-  if (!claims.sub || (claims.exp && claims.exp <= nowSeconds)) {
+  // A token with no expiry is accepted forever, so a leaked or over-scoped
+  // credential can never be aged out. Require exp explicitly.
+  if (!claims.sub || typeof claims.exp !== 'number') {
+    throw new Error('Expired authentication token');
+  }
+  if (claims.exp <= nowSeconds) {
     throw new Error('Expired authentication token');
   }
 
   if (claims.role && claims.role !== 'authenticated') {
     throw new Error('Authenticated user token required');
+  }
+
+  // Audience and issuer are only meaningful when this relayer is configured to
+  // expect a specific one. When unset, accept any value (backwards compatible);
+  // when set, a mismatch means the token was minted for a different service.
+  const expectedAud = config.supabaseJwtAudience;
+  const expectedIss = config.supabaseJwtIssuer;
+  if (expectedAud && claims.aud !== expectedAud) {
+    throw new Error('Authentication token audience mismatch');
+  }
+  if (expectedIss && claims.iss !== expectedIss) {
+    throw new Error('Authentication token issuer mismatch');
   }
 
   return claims;
@@ -1399,7 +1428,6 @@ async function getAccountStatus(accountId) {
  * - Eviction: Expired entries are pruned on every acquisition; oldest entries evicted if capacity exceeded.
  */
 const MAX_ACTIVE_ADD_MONEY_USER_LOCKS = 1000;
-const activeAddMoneyUserLocks = Object.create(null);
 
 function pruneActiveAddMoneyUserLocks(now = Date.now()) {
   for (const [key, expiry] of Object.entries(activeAddMoneyUserLocks)) {
@@ -1753,8 +1781,6 @@ async function setIdempotencyResponse(key, response, ttlMs) {
     console.warn('Idempotency update failed:', error.message);
   }
 }
-
-const inMemoryPaymentRecords = [];
 
 async function getPaymentRecords(accountId, authUserId, sinceIso) {
   if (!isSupabasePersistenceEnabled()) {
