@@ -9,7 +9,11 @@ import { supabase } from './supabase';
 import { StellarWallet } from './wallet';
 
 const CLOUD_BACKUP_VERSION = 1;
-const CLOUD_BACKUP_KDF_ITERATIONS = 60000;
+// Cloud backups protect a wallet secret at rest in Supabase, so they must not
+// be weaker than the local wallet KDF. The local floor is 600,000 iterations;
+// the backup KDF now matches it. Existing v1 backups carry their own
+// kdf_iterations and restore unchanged — see restoreCloudWalletBackup.
+const CLOUD_BACKUP_KDF_ITERATIONS = 600000;
 const CLOUD_BACKUP_PASSWORD_MIN_LENGTH = 12;
 
 export type CloudWalletBackupRow = {
@@ -133,6 +137,9 @@ export async function createCloudWalletBackup(
   const cipher = xchacha20poly1305(key, nonce);
   const ciphertext = cipher.encrypt(utf8ToBytes(wallet.secret));
 
+  // The row records the parameters that were actually used to derive the key,
+  // so a future reader can verify metadata against reality rather than trusting
+  // a constant that may have changed since the backup was written.
   const row: CloudWalletBackupRow = {
     auth_user_id: authUserId,
     wallet_address: wallet.publicKey,
