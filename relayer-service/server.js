@@ -107,6 +107,10 @@ const PREPARED_ACCOUNT_TRANSACTION_TTL_MS = 5 * 60 * 1000;
 const MAX_PREPARED_ACCOUNT_TRANSACTIONS = 10000;
 const preparedAccountTransactions = Object.create(null);
 
+// Hoisted so testHooks can re-export them before module evaluation completes.
+const inMemoryPaymentRecords = [];
+const activeAddMoneyUserLocks = Object.create(null);
+
 app.use(helmet());
 app.use(cors({ origin: parseCorsOrigin(process.env.CORS_ORIGIN || '*') }));
 app.use(express.json({ limit: '64kb' }));
@@ -628,6 +632,14 @@ let relayerHttpServer = null;
 async function startRelayer() {
   if (config.authRequired) {
     await assertWalletBindingsReachable();
+    // An auth-enabled relayer must know what audience and issuer to expect.
+    // If neither an override nor a derivable Supabase issuer is available,
+    // refuse to start rather than accepting any audience or issuer.
+    if (!config.supabaseJwtIssuer || !config.supabaseJwtAudience) {
+      throw new Error(
+        'SUPABASE_JWT_ISSUER and SUPABASE_JWT_AUDIENCE must be configured when authentication is enabled'
+      );
+    }
   }
 
   relayerHttpServer = await new Promise((resolve, reject) => {
@@ -698,6 +710,7 @@ module.exports = {
       activeAddMoneyUserLocks,
       pruneActiveAddMoneyUserLocks,
       requireAccountPreparationOwnership,
+      verifySupabaseJwt,
     }),
   } : {}),
 };
@@ -717,6 +730,16 @@ function loadConfig() {
   const addMoneyEnabled = networkName === 'testnet' && readBooleanEnv('ENABLE_TESTNET_FAUCET', false);
   const supabaseJwtSecret = process.env.SUPABASE_JWT_SECRET || '';
   const supabaseUrl = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
+  // Expected audience and issuer for the HS256 path. Defaults follow Supabase
+  // conventions: the audience is the `authenticated` role, and the issuer is
+  // the project's auth endpoint. Both can be overridden for a non-standard
+  // deployment, but they are never silently skipped — an auth-enabled relayer
+  // that cannot determine what to expect fails startup closed rather than
+  // accepting any audience or issuer.
+  const supabaseJwtAudience = process.env.SUPABASE_JWT_AUDIENCE || 'authenticated';
+  const supabaseJwtIssuer =
+    process.env.SUPABASE_JWT_ISSUER ||
+    (supabaseUrl ? `${supabaseUrl.replace(/\/$/, '')}/auth/v1` : '');
   const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
   assertTrustedHorizonUrl(horizonUrl);
@@ -756,6 +779,8 @@ function loadConfig() {
     lowAssetThreshold: Number(process.env.LOW_USDC_THRESHOLD || 100),
     authRequired,
     supabaseJwtSecret,
+    supabaseJwtAudience,
+    supabaseJwtIssuer,
     supabaseUrl,
     supabaseServiceRoleKey,
     addMoneyEnabled,
@@ -1205,12 +1230,35 @@ async function verifySupabaseJwt(authorizationHeader) {
 
   const claims = JSON.parse(base64UrlDecode(encodedPayload).toString('utf8'));
   const nowSeconds = Math.floor(Date.now() / 1000);
-  if (!claims.sub || (claims.exp && claims.exp <= nowSeconds)) {
+  // A token with no expiry is accepted forever, so a leaked or over-scoped
+  // credential can never be aged out. Require exp explicitly.
+  if (!claims.sub || typeof claims.exp !== 'number') {
+    throw new Error('Expired authentication token');
+  }
+  if (claims.exp <= nowSeconds) {
     throw new Error('Expired authentication token');
   }
 
   if (claims.role && claims.role !== 'authenticated') {
     throw new Error('Authenticated user token required');
+  }
+
+  // Audience and issuer are always enforced on this path. `aud` may be a
+  // string or an array containing the expected value, per RFC 7519. A token
+  // minted for a different service is rejected even though its signature is
+  // valid.
+  const expectedAud = config.supabaseJwtAudience;
+  const expectedIss = config.supabaseJwtIssuer;
+  if (!expectedAud || !expectedIss) {
+    // Only reachable when auth is required but no issuer could be derived.
+    throw new Error('Authentication token issuer is not configured');
+  }
+  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!audiences.includes(expectedAud)) {
+    throw new Error('Authentication token audience mismatch');
+  }
+  if (claims.iss !== expectedIss) {
+    throw new Error('Authentication token issuer mismatch');
   }
 
   return claims;
@@ -1399,7 +1447,6 @@ async function getAccountStatus(accountId) {
  * - Eviction: Expired entries are pruned on every acquisition; oldest entries evicted if capacity exceeded.
  */
 const MAX_ACTIVE_ADD_MONEY_USER_LOCKS = 1000;
-const activeAddMoneyUserLocks = Object.create(null);
 
 function pruneActiveAddMoneyUserLocks(now = Date.now()) {
   for (const [key, expiry] of Object.entries(activeAddMoneyUserLocks)) {
@@ -1753,8 +1800,6 @@ async function setIdempotencyResponse(key, response, ttlMs) {
     console.warn('Idempotency update failed:', error.message);
   }
 }
-
-const inMemoryPaymentRecords = [];
 
 async function getPaymentRecords(accountId, authUserId, sinceIso) {
   if (!isSupabasePersistenceEnabled()) {
