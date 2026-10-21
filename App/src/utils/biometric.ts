@@ -58,6 +58,51 @@ export async function authenticateWithPIN(): Promise<boolean> {
  * 2. Biometric-protected wallet backup
  * 3. PIN dialog fallback
  */
+/**
+ * Resolve a wallet for secret-key export.
+ *
+ * This deliberately does NOT consult the signing session cache. Revealing a
+ * raw private key or a Stellar secret seed is a one-way disclosure: whoever
+ * reads it controls the wallet forever. A 15-minute signing session is far too
+ * weak a gate for that, so export always requires a fresh PIN or biometric.
+ *
+ * Ordinary signing keeps using getAuthenticatedWallet() and its session cache;
+ * only export goes through here.
+ */
+export async function getWalletForSecretExport(): Promise<StellarWallet | null> {
+  try {
+    const biometricEnabled = await AsyncStorage.getItem('biometric_enabled');
+    const available = await isBiometricAvailable();
+    if (biometricEnabled === 'true' && available) {
+      const biometricWallet = await getWalletFromBiometricBackup('Confirm your identity to export keys');
+      if (biometricWallet) {
+        return biometricWallet;
+      }
+    }
+  } catch (error) {
+    Logger.warn('Biometric export authentication failed', error);
+  }
+
+  if (!showPINDialog) {
+    return null;
+  }
+
+  const inputPin = await showPINDialog(
+    'Export Wallet Key',
+    'Enter your 6-digit PIN to export this key'
+  );
+  if (!inputPin || inputPin.length !== 6) {
+    return null;
+  }
+
+  const res = await getWallet(inputPin);
+  if (res.success && res.wallet) {
+    return res.wallet;
+  }
+
+  return null;
+}
+
 export async function getAuthenticatedWallet(
   title: string = 'Enter PIN',
   message: string = 'Enter your 6-digit PIN to confirm',

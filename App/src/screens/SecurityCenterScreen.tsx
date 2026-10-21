@@ -21,6 +21,7 @@ import {
   getBiometricType,
   enableBiometric,
   getAuthenticatedWallet,
+  getWalletForSecretExport,
 } from '../utils/biometric';
 import {
   clearBiometricBackup,
@@ -198,11 +199,9 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   };
 
   const revealWalletKey = async (type: 'private' | 'stellar') => {
-    const wallet = await getAuthenticatedWallet(
-      'Export Wallet Key',
-      'Enter your C-Pay PIN to export this key',
-      'Export wallet key'
-    );
+    // Secret export must not ride on the signing session cache. Use the
+    // dedicated fresh-authentication path instead of getAuthenticatedWallet().
+    const wallet = await getWalletForSecretExport();
 
     if (!wallet) {
       AlertManager.alert('Authentication Required', 'Unlock your wallet with PIN or biometric to export keys.');
@@ -235,6 +234,11 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   const handleCloseExportedKey = () => {
     setExportedKey(null);
     setShowExportedKey(false);
+    // The secret that was just on screen must not outlive the modal. Clearing
+    // React state alone leaves the seed readable by anything that can see the
+    // clipboard, so clear the clipboard too. Best-effort: some platforms do not
+    // expose a reliable clear, and a failure here must not break the close.
+    Clipboard.setStringAsync('').catch(() => {});
   };
 
   const isSecret = exportedKey?.valueLabel === 'Key';
