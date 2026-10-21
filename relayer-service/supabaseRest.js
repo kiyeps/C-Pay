@@ -59,15 +59,27 @@ async function executeSupabaseRequest({
   const cleanBase = baseUrl ? baseUrl.replace(/\/$/, '') : '';
   const url = `${cleanBase}/rest/v1/${path}`;
 
-  const response = await doFetch(url, {
-    ...options,
-    headers: {
-      apikey: serviceRoleKey,
-      Authorization: `Bearer ${serviceRoleKey}`,
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
-  });
+  // A deadline is attached unless the caller supplied its own signal, in which
+  // case the caller keeps full control. The timer is always cleared by the
+  // helper, including on success and on failure.
+  const { createDeadlineSignal } = require('./fetchDeadline');
+  const { signal, cleanup } = createDeadlineSignal(undefined, options.signal);
+
+  let response;
+  try {
+    response = await doFetch(url, {
+      ...options,
+      signal,
+      headers: {
+        apikey: serviceRoleKey,
+        Authorization: `Bearer ${serviceRoleKey}`,
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      },
+    });
+  } finally {
+    cleanup();
+  }
 
   const text = await response.text();
   let body = null;
