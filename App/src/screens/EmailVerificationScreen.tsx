@@ -50,7 +50,6 @@ const USER_EMAIL_KEY = 'user_email';
 type ExistingUserProfile = {
   wallet_address: string;
   display_name?: string | null;
-  cpay_id?: string | null;
   profile_photo_url?: string | null;
 };
 
@@ -138,7 +137,7 @@ export const EmailVerificationScreen: React.FC<EmailVerificationScreenProps> = (
 
     const { data, error } = await supabase
       .from('users')
-      .select('wallet_address, display_name, cpay_id, profile_photo_url')
+      .select('wallet_address, display_name, profile_photo_url')
       .eq('auth_user_id', userId)
       .maybeSingle();
 
@@ -256,7 +255,6 @@ export const EmailVerificationScreen: React.FC<EmailVerificationScreenProps> = (
             verifiedEmail,
             walletAddress: existingProfile?.wallet_address || localWalletAddress || '',
             displayName: existingProfile?.display_name || null,
-            cpayId: existingProfile?.cpay_id || null,
             profilePhotoUrl: existingProfile?.profile_photo_url || null,
             accountSwitch: true,
           });
@@ -267,7 +265,6 @@ export const EmailVerificationScreen: React.FC<EmailVerificationScreenProps> = (
             verifiedEmail,
             walletAddress: existingProfile.wallet_address,
             displayName: existingProfile.display_name || null,
-            cpayId: existingProfile.cpay_id || null,
             profilePhotoUrl: existingProfile.profile_photo_url || null,
           });
           setLoading(false);

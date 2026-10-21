@@ -21,7 +21,6 @@ import { supabase } from '../services/supabase';
 import { COLORS, SPACING, FONT_SIZES, BORDER_RADIUS, SHADOWS, createThemedStyles, useTheme } from '../constants/theme';
 import { Button, OnboardingProgress, FormField, InfoBanner } from '../components';
 import { AlertManager } from '../utils/alert';
-import { generateCPayId } from '../utils/cpayId';
 
 interface ProfileSetupScreenProps {
   navigation: any;
@@ -118,7 +117,6 @@ export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigati
   const completeProfileSetup = async (
     name: string,
     emailToSave: string | null,
-    cpayId: string,
     photoUri: string | null
   ): Promise<void> => {
     let photoUrl: string | null = null;
@@ -133,7 +131,7 @@ export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigati
     const { data: sessionData } = await supabase.auth.getSession();
     const authUserId = sessionData.session?.user.id || null;
 
-    const { error: dbError } = await supabase
+    const { data, error: dbError } = await supabase
       .from('users')
       .upsert(
         {
@@ -141,15 +139,23 @@ export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigati
           wallet_address: walletAddress,
           display_name: name,
           email: emailToSave,
-          cpay_id: cpayId,
           profile_photo_url: photoUrl,
         },
         { onConflict: 'wallet_address' }
-      );
+      )
+      .select('cpay_id')
+      .single();
 
     if (dbError) {
       Logger.error('Database error:', dbError);
+      throw dbError;
     }
+
+    if (!data?.cpay_id) {
+      throw new Error('The database did not assign a C-Pay ID to this wallet.');
+    }
+
+    await AsyncStorage.setItem('cpay_id', data.cpay_id);
   };
 
   const handleComplete = async () => {
@@ -170,14 +176,9 @@ export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigati
 
       const emailToSave = await AsyncStorage.getItem('user_email');
 
-      // Generate a public C-Pay ID for display and receiving payments.
-      const cpayId = generateCPayId(emailToSave || '', walletAddress);
-
       // Save locally
       const localWrites = [
         AsyncStorage.setItem('display_name', trimmedName),
-        AsyncStorage.setItem('cpay_id', cpayId),
-        AsyncStorage.setItem('profile_complete', 'true'),
         AsyncStorage.setItem('cloud_backup_required', 'true'),
         AsyncStorage.setItem('cloud_backup_complete', 'false'),
       ];
@@ -189,7 +190,8 @@ export const ProfileSetupScreen: React.FC<ProfileSetupScreenProps> = ({ navigati
       await Promise.all(localWrites);
 
       // Complete profile upload/cloud save here so the next screen opens cleanly.
-      await completeProfileSetup(trimmedName, emailToSave, cpayId, profilePhoto);
+      await completeProfileSetup(trimmedName, emailToSave, profilePhoto);
+      await AsyncStorage.setItem('profile_complete', 'true');
 
       // Cloud backup protects the wallet before optional biometric setup.
       navigation.replace('CloudBackupSetup');
