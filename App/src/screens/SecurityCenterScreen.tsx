@@ -1,5 +1,10 @@
 import { Logger } from '../utils/logger';
-import React, { useState } from 'react';
+import { cancelClipboardClear, scheduleClipboardClear } from '../utils/clipboardLifecycle';
+import {
+  enableSecretCaptureProtection,
+  releaseSecretCaptureProtection,
+} from '../utils/secretCaptureLifecycle';
+import React, { useState, useEffect, useRef } from 'react';
 
 // Security center screen: access protection and risk controls overview.
 import {
@@ -10,6 +15,7 @@ import {
   TouchableOpacity,
   Modal,
   Platform,
+  AppState,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -21,6 +27,7 @@ import {
   getBiometricType,
   enableBiometric,
   getAuthenticatedWallet,
+  getWalletForSecretExport,
 } from '../utils/biometric';
 import {
   clearBiometricBackup,
@@ -57,12 +64,74 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   const [exportedKey, setExportedKey] = useState<ExportedKey | null>(null);
   const [showExportedKey, setShowExportedKey] = useState(false);
   const biometricSavingRef = React.useRef(false);
+  // A revealed secret must not outlive the modal. The timer lives in
+  // clipboardLifecycle so the behaviour is testable without mounting this
+  // screen, and is cancelled on close, background, and unmount.
+  const clearExportedClipboard = () => {
+    void cancelClipboardClear();
+  };
+
+  // While a secret is on screen, screenshots and screen recording must be
+  // blocked. `preventScreenCaptureAsync` is keyed so a late resolution from a
+  // previous open cannot fight the current one, and the release is always
+  // attempted even if the enable failed, so a failed enable never leaves
+  // capture permanently blocked.
+  const [captureProtectionFailed, setCaptureProtectionFailed] = useState(false);
+  const captureGeneration = React.useRef(0);
+
+  React.useEffect(() => {
+    if (!showExportedKey) return undefined;
+
+    const generation = ++captureGeneration.current;
+    let released = false;
+
+    enableSecretCaptureProtection()
+      .then((result) => {
+        // A newer open superseded this one; do not touch shared state.
+        if (generation !== captureGeneration.current) return;
+        // Fail closed in the UI sense: the user is told protection is off
+        // rather than being left to assume a screenshot is blocked.
+        setCaptureProtectionFailed(!result.ok);
+      })
+      .catch(() => {
+        if (generation !== captureGeneration.current) return;
+        setCaptureProtectionFailed(true);
+      });
+
+    return () => {
+      released = true;
+      // Always release, even when the enable never resolved. The module is
+      // keyed so a late-resolving prevent is still covered by this release.
+      void releaseSecretCaptureProtection();
+      if (generation === captureGeneration.current) {
+        captureGeneration.current += 1;
+      }
+      void released;
+    };
+  }, [showExportedKey]);
 
   useFocusEffect(
     React.useCallback(() => {
       loadSecurity();
     }, [])
   );
+
+  // Leaving the app with a revealed secret on screen is the worst case: the
+  // clipboard may still hold the seed and the app switcher may show the modal.
+  // Close the modal and clear the clipboard on background, and on unmount.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') {
+        setExportedKey(null);
+        setShowExportedKey(false);
+        clearExportedClipboard();
+      }
+    });
+    return () => {
+      sub.remove();
+      clearExportedClipboard();
+    };
+  }, []);
 
   const loadSecurity = async () => {
     const [address, biometricSetting, available, type, backupAvailable, cloudComplete] = await Promise.all([
@@ -198,11 +267,9 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   };
 
   const revealWalletKey = async (type: 'private' | 'stellar') => {
-    const wallet = await getAuthenticatedWallet(
-      'Export Wallet Key',
-      'Enter your C-Pay PIN to export this key',
-      'Export wallet key'
-    );
+    // Secret export must not ride on the signing session cache. Use the
+    // dedicated fresh-authentication path instead of getAuthenticatedWallet().
+    const wallet = await getWalletForSecretExport();
 
     if (!wallet) {
       AlertManager.alert('Authentication Required', 'Unlock your wallet with PIN or biometric to export keys.');
@@ -229,12 +296,17 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   const handleCopyExportedKey = async () => {
     if (!exportedKey) return;
     await Clipboard.setStringAsync(exportedKey.value);
+    // The clipboard is the weakest link: anything that can read it now holds a
+    // wallet seed. Clear it shortly after the copy instead of leaving it there
+    // indefinitely.
+    scheduleClipboardClear();
     AlertManager.alert('Copied', `${exportedKey.title} copied to clipboard.`, undefined, { type: 'success' });
   };
 
   const handleCloseExportedKey = () => {
     setExportedKey(null);
     setShowExportedKey(false);
+    clearExportedClipboard();
   };
 
   const isSecret = exportedKey?.valueLabel === 'Key';
@@ -368,6 +440,14 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
       >
         <View style={styles.modalBackdrop}>
           <View style={styles.exportModal}>
+            {captureProtectionFailed && (
+              <View style={styles.captureWarning}>
+                <Text style={styles.captureWarningText}>
+                  Screen capture could not be blocked on this device. Avoid taking screenshots while
+                  this key is visible.
+                </Text>
+              </View>
+            )}
             <View style={styles.exportModalHeader}>
               <View style={[styles.exportIconCircle, isSecret && styles.exportIconCircleWarn]}>
                 <Ionicons name="key-outline" size={24} color={isSecret ? COLORS.warning : COLORS.primary} />
@@ -449,6 +529,18 @@ const styles = createThemedStyles((COLORS) => ({
     borderWidth: 1,
     borderColor: COLORS.border,
     ...SHADOWS.lg,
+  },
+  captureWarning: {
+    backgroundColor: COLORS.warning + '22',
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.warning,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  captureWarningText: {
+    color: COLORS.warning,
+    fontSize: 12,
+    lineHeight: 17,
   },
   exportModalHeader: {
     flexDirection: 'row',

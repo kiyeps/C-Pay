@@ -76,6 +76,7 @@
       "^@react-native-async-storage/async-storage$": "<rootDir>/src/__mocks__/asyncStorage.ts",
       "^expo-secure-store$": "<rootDir>/src/__mocks__/expoSecureStore.ts",
       "^expo-crypto$": "<rootDir>/src/__mocks__/expoCrypto.ts",
+      "^expo-clipboard$": "<rootDir>/src/__mocks__/expoClipboard.ts",
       "^react-native$": "<rootDir>/src/__mocks__/reactNative.ts",
       "^expo-constants$": "<rootDir>/src/__mocks__/expoConstants.ts",
       "^\\.\\./services/supabase$": "<rootDir>/src/__mocks__/supabase.ts",
