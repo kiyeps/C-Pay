@@ -4,6 +4,7 @@ import {
   enableSecretCaptureProtection,
   releaseSecretCaptureProtection,
 } from '../utils/secretCaptureLifecycle';
+import { revealSecretWithCaptureProtection } from '../utils/secretExportController';
 import React, { useState, useEffect, useRef } from 'react';
 
 // Security center screen: access protection and risk controls overview.
@@ -52,6 +53,20 @@ interface SecurityCenterScreenProps {
   navigation: any;
 }
 
+/**
+ * Test-only hooks. The reveal and close handlers are driven directly in tests
+ * because a synthetic press on the modal's TouchableOpacity is not reliable in
+ * this Jest setup, and the ordering under test lives inside the handler.
+ * Not referenced by production code paths.
+ */
+export const __testHooks: {
+  triggerReveal: null | ((type: 'private' | 'stellar') => Promise<void>);
+  triggerClose: null | (() => void);
+} = {
+  triggerReveal: null,
+  triggerClose: null,
+};
+
 export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navigation }) => {
   useTheme();
   const [walletAddress, setWalletAddress] = useState('');
@@ -63,6 +78,10 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   const [dailyLimitLabel, setDailyLimitLabel] = useState('');
   const [exportedKey, setExportedKey] = useState<ExportedKey | null>(null);
   const [showExportedKey, setShowExportedKey] = useState(false);
+  // The secret stays masked until capture protection has actually been enabled.
+  // `captureProtectionPending` covers the window where the native call is still
+  // in flight, so plaintext is never rendered unprotected.
+  const [captureProtectionPending, setCaptureProtectionPending] = useState(false);
   const biometricSavingRef = React.useRef(false);
   // A revealed secret must not outlive the modal. The timer lives in
   // clipboardLifecycle so the behaviour is testable without mounting this
@@ -76,37 +95,22 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
   // previous open cannot fight the current one, and the release is always
   // attempted even if the enable failed, so a failed enable never leaves
   // capture permanently blocked.
-  const [captureProtectionFailed, setCaptureProtectionFailed] = useState(false);
+  // Release capture protection whenever the modal closes or the screen
+  // unmounts. Enabling is owned exclusively by the reveal handler, so there is
+  // no double-enable and no window where plaintext renders before protection.
+  // The release is always attempted, so a late-resolving enable cannot leave
+  // capture permanently blocked.
   const captureGeneration = React.useRef(0);
 
   React.useEffect(() => {
     if (!showExportedKey) return undefined;
 
     const generation = ++captureGeneration.current;
-    let released = false;
-
-    enableSecretCaptureProtection()
-      .then((result) => {
-        // A newer open superseded this one; do not touch shared state.
-        if (generation !== captureGeneration.current) return;
-        // Fail closed in the UI sense: the user is told protection is off
-        // rather than being left to assume a screenshot is blocked.
-        setCaptureProtectionFailed(!result.ok);
-      })
-      .catch(() => {
-        if (generation !== captureGeneration.current) return;
-        setCaptureProtectionFailed(true);
-      });
-
     return () => {
-      released = true;
-      // Always release, even when the enable never resolved. The module is
-      // keyed so a late-resolving prevent is still covered by this release.
       void releaseSecretCaptureProtection();
       if (generation === captureGeneration.current) {
         captureGeneration.current += 1;
       }
-      void released;
     };
   }, [showExportedKey]);
 
@@ -279,19 +283,46 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
     const isPrivateKey = type === 'private';
     const value = isPrivateKey ? formatRawPrivateKey(wallet.keypair.rawSecretKey()) : wallet.secret;
 
-    setExportedKey({
+    const nextKey = {
       title: isPrivateKey ? 'Private Key' : 'Stellar Secret Key',
       description: isPrivateKey
         ? 'Raw Ed25519 private seed in hex format.'
-        : 'Importable Stellar secret seed. This starts with S.',
+        : 'Importable Stellar secret key. This starts with S.',
       valueLabel: 'Key',
       value,
       warning: isPrivateKey
         ? 'Anyone with this private key can control your C-Pay wallet.'
         : 'Anyone with this Stellar secret key can control your C-Pay wallet.',
+    };
+
+    // Enable capture protection FIRST. Only once it has actually succeeded do
+    // we render the secret unmasked. If it fails, the secret is never handed
+    // back, so there is nothing unmasked to show and the user is told why.
+    setCaptureProtectionPending(true);
+    const outcome = await revealSecretWithCaptureProtection(async () => {
+      const fresh = await getWalletForSecretExport();
+      if (!fresh) return null;
+      return isPrivateKey ? formatRawPrivateKey(fresh.keypair.rawSecretKey()) : fresh.secret;
     });
-    setShowExportedKey(false);
+    setCaptureProtectionPending(false);
+
+    if (outcome.status !== 'revealed') {
+      setExportedKey(null);
+      setShowExportedKey(false);
+      AlertManager.alert(
+        'Cannot Reveal Key',
+        outcome.reason === 'capture-protection-unavailable'
+          ? 'Screen capture could not be blocked on this device, so the key will not be shown. Use a supported device or a screenshot-free path.'
+          : 'Unlock your wallet with PIN or biometric to export keys.'
+      );
+      return;
+    }
+
+    setExportedKey({ ...nextKey, value: outcome.value });
+    setShowExportedKey(true);
   };
+
+  __testHooks.triggerReveal = revealWalletKey;
 
   const handleCopyExportedKey = async () => {
     if (!exportedKey) return;
@@ -303,11 +334,13 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
     AlertManager.alert('Copied', `${exportedKey.title} copied to clipboard.`, undefined, { type: 'success' });
   };
 
-  const handleCloseExportedKey = () => {
+    const handleCloseExportedKey = () => {
     setExportedKey(null);
     setShowExportedKey(false);
     clearExportedClipboard();
   };
+
+  __testHooks.triggerClose = handleCloseExportedKey;
 
   const isSecret = exportedKey?.valueLabel === 'Key';
 
@@ -440,14 +473,6 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
       >
         <View style={styles.modalBackdrop}>
           <View style={styles.exportModal}>
-            {captureProtectionFailed && (
-              <View style={styles.captureWarning}>
-                <Text style={styles.captureWarningText}>
-                  Screen capture could not be blocked on this device. Avoid taking screenshots while
-                  this key is visible.
-                </Text>
-              </View>
-            )}
             <View style={styles.exportModalHeader}>
               <View style={[styles.exportIconCircle, isSecret && styles.exportIconCircleWarn]}>
                 <Ionicons name="key-outline" size={24} color={isSecret ? COLORS.warning : COLORS.primary} />
@@ -468,8 +493,17 @@ export const SecurityCenterScreen: React.FC<SecurityCenterScreenProps> = ({ navi
             <View style={styles.exportKeyBox}>
               <Text style={styles.exportKeyLabel}>{exportedKey?.valueLabel || 'Value'}</Text>
               <Text style={styles.exportKeyValue} selectable={showExportedKey}>
-                {exportedKey ? (showExportedKey ? exportedKey.value : maskKey(exportedKey.value)) : ''}
+                {exportedKey
+                  ? showExportedKey
+                    ? exportedKey.value
+                    : maskKey(exportedKey.value)
+                  : ''}
               </Text>
+              {captureProtectionPending && (
+                <Text style={styles.captureWarningText}>
+                  Enabling screen-capture protection…
+                </Text>
+              )}
             </View>
 
             <View style={styles.exportActions}>
