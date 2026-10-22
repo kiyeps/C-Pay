@@ -58,6 +58,24 @@ function makeHangingServer() {
   return { server, sockets };
 }
 
+/** A server that sends status/headers and then never writes the body. */
+function makeHeaderStallServer() {
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    req.on('data', () => {});
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.write('{"partial":'); // flush headers, then stall
+      // Never call res.end().
+    });
+  });
+  server.on('connection', (s) => {
+    sockets.add(s);
+    s.on('close', () => sockets.delete(s));
+  });
+  return { server, sockets };
+}
+
 /** A server that records the request and returns a fixed status. */
 function makeRecordingServer(status, body) {
   const hits = [];
@@ -90,10 +108,12 @@ function close(server) {
 }
 
 async function main() {
-  const { fetchWithDeadline, createDeadlineSignal, DEFAULT_TIMEOUT_MS } = require(path.join(
-    SERVICE_DIR,
-    'fetchDeadline.js'
-  ));
+  const {
+    fetchWithDeadline,
+    fetchJsonWithDeadline,
+    createDeadlineSignal,
+    DEFAULT_TIMEOUT_MS,
+  } = require(path.join(SERVICE_DIR, 'fetchDeadline.js'));
 
   // ── 1. A hanging endpoint aborts within the bound ────────────────────────
   const hanging = makeHangingServer();
@@ -117,9 +137,13 @@ async function main() {
   const okPort = await listen(ok.server);
 
   await check('a normal 2xx response is returned unchanged', async () => {
-    const res = await fetchWithDeadline(`http://127.0.0.1:${okPort}/ok`, { method: 'POST' }, 2000);
-    if (res.status !== 200) throw new Error(`status ${res.status}`);
-    const body = await res.json();
+    const { response, text } = await fetchWithDeadline(
+      `http://127.0.0.1:${okPort}/ok`,
+      { method: 'POST' },
+      2000
+    );
+    if (response.status !== 200) throw new Error(`status ${response.status}`);
+    const body = JSON.parse(text);
     if (!body.ok) throw new Error('body mismatch');
   });
 
@@ -128,9 +152,13 @@ async function main() {
   const errPort = await listen(err.server);
 
   await check('a normal non-2xx response is returned, not thrown', async () => {
-    const res = await fetchWithDeadline(`http://127.0.0.1:${errPort}/err`, { method: 'POST' }, 2000);
-    if (res.status !== 500) throw new Error(`status ${res.status}`);
-    const body = await res.json();
+    const { response, text } = await fetchWithDeadline(
+      `http://127.0.0.1:${errPort}/err`,
+      { method: 'POST' },
+      2000
+    );
+    if (response.status !== 500) throw new Error(`status ${response.status}`);
+    const body = JSON.parse(text);
     if (!body.error) throw new Error('body mismatch');
   });
 
@@ -210,10 +238,100 @@ async function main() {
     if (DEFAULT_TIMEOUT_MS !== 5000) throw new Error(`default is ${DEFAULT_TIMEOUT_MS}`);
   });
 
+  // ── 10. A body stall is bounded, not just a header stall ─────────────────
+  const bodyStall = makeHeaderStallServer();
+  const bodyStallPort = await listen(bodyStall.server);
+
+  await check('a peer that stalls the body after headers is still bounded', async () => {
+    const started = Date.now();
+    let aborted = false;
+    try {
+      await fetchWithDeadline(`http://127.0.0.1:${bodyStallPort}/stall`, { method: 'POST' }, 800);
+    } catch (error) {
+      aborted = error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+    }
+    const elapsed = Date.now() - started;
+    if (!aborted) throw new Error('body stall was not aborted');
+    if (elapsed > 4000) throw new Error(`took too long: ${elapsed}ms`);
+  });
+
+  // ── 11. JSON parsing settles within the bound on a body stall ────────────
+  await check('fetchJsonWithDeadline settles within the bound on a body stall', async () => {
+    const started = Date.now();
+    let threw = false;
+    try {
+      await fetchJsonWithDeadline(`http://127.0.0.1:${bodyStallPort}/stall`, { method: 'POST' }, 800);
+    } catch {
+      threw = true;
+    }
+    const elapsed = Date.now() - started;
+    if (!threw) throw new Error('did not throw on body stall');
+    if (elapsed > 4000) throw new Error(`took too long: ${elapsed}ms`);
+  });
+
+  // ── 12. A responsive JSON endpoint parses correctly ──────────────────────
+  await check('fetchJsonWithDeadline returns status and parsed body on success', async () => {
+    const result = await fetchJsonWithDeadline(
+      `http://127.0.0.1:${okPort}/ok`,
+      { method: 'POST' },
+      2000
+    );
+    if (result.status !== 200) throw new Error(`status ${result.status}`);
+    if (!result.ok) throw new Error('ok flag false');
+    if (!result.body || result.body.ok !== true) throw new Error('body mismatch');
+  });
+
+  // ── 13. The fallback path detaches its caller-signal listener ────────────
+  await check('the fallback path detaches the caller-signal listener on cleanup', async () => {
+    // Force the no-AbortSignal.timeout branch by hiding it.
+    const realTimeout = AbortSignal.timeout;
+    AbortSignal.timeout = undefined;
+    try {
+      const controller = new AbortController();
+      const before = controller.signal.listenerCount
+        ? controller.signal.listenerCount('abort')
+        : 0;
+
+      const { cleanup } = createDeadlineSignal(60000, controller.signal);
+      const during = controller.signal.listenerCount
+        ? controller.signal.listenerCount('abort')
+        : 1;
+      cleanup();
+      const after = controller.signal.listenerCount
+        ? controller.signal.listenerCount('abort')
+        : 0;
+
+      if (during <= before) throw new Error('listener was not attached');
+      if (after !== before) throw new Error(`listener leaked: ${after} vs ${before}`);
+    } finally {
+      AbortSignal.timeout = realTimeout;
+    }
+  });
+
+  // ── 14. Repeated completed calls do not accumulate listeners ─────────────
+  await check('repeated completed calls do not accumulate listeners', async () => {
+    const realTimeout = AbortSignal.timeout;
+    AbortSignal.timeout = undefined;
+    try {
+      const controller = new AbortController();
+      for (let i = 0; i < 5; i += 1) {
+        const { cleanup } = createDeadlineSignal(60000, controller.signal);
+        cleanup();
+      }
+      const remaining = controller.signal.listenerCount
+        ? controller.signal.listenerCount('abort')
+        : 0;
+      if (remaining !== 0) throw new Error(`${remaining} listeners leaked over 5 calls`);
+    } finally {
+      AbortSignal.timeout = realTimeout;
+    }
+  });
+
   await close(hanging.server);
   await close(ok.server);
   await close(err.server);
   await close(webhook.server);
+  await close(bodyStall.server);
 
   for (const [status, name] of results) console.log(`${status} ${name}`);
   const failed = results.filter((r) => r[0] === 'not ok').length;
