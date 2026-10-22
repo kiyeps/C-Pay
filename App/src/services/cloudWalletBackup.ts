@@ -9,7 +9,14 @@ import { supabase } from './supabase';
 import { StellarWallet } from './wallet';
 
 const CLOUD_BACKUP_VERSION = 1;
-const CLOUD_BACKUP_KDF_ITERATIONS = 60000;
+// Cloud backups encrypt a wallet secret at rest, so the KDF has to be at least
+// as strong as the local wallet KDF floor. It was an order of magnitude below
+// it, which made an exposed backup row cheap to attack offline.
+//
+// Restore reads the iteration count stored on the row rather than this constant,
+// so a backup written at the old value still opens. Raising the write path does
+// not strand existing users.
+const CLOUD_BACKUP_KDF_ITERATIONS = 600000;
 const CLOUD_BACKUP_PASSWORD_MIN_LENGTH = 12;
 
 export type CloudWalletBackupRow = {
