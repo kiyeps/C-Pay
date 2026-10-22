@@ -59,17 +59,29 @@ async function executeSupabaseRequest({
   const cleanBase = baseUrl ? baseUrl.replace(/\/$/, '') : '';
   const url = `${cleanBase}/rest/v1/${path}`;
 
-  const response = await doFetch(url, {
-    ...options,
-    headers: {
-      apikey: serviceRoleKey,
-      Authorization: `Bearer ${serviceRoleKey}`,
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
-  });
+  // The deadline stays live through body consumption, so a peer that sends
+  // headers and then stalls the body is bounded too. The timer and any abort
+  // listener are cleared by the helper on every exit path.
+  const { createDeadlineSignal } = require('./fetchDeadline');
+  const { signal, cleanup } = createDeadlineSignal(undefined, options.signal);
 
-  const text = await response.text();
+  let response;
+  let text;
+  try {
+    response = await doFetch(url, {
+      ...options,
+      signal,
+      headers: {
+        apikey: serviceRoleKey,
+        Authorization: `Bearer ${serviceRoleKey}`,
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      },
+    });
+    text = await response.text();
+  } finally {
+    cleanup();
+  }
   let body = null;
   if (text) {
     try {

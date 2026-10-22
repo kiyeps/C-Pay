@@ -1221,7 +1221,7 @@ async function verifySupabaseTokenWithAuthApi(token) {
     throw new Error('Unsupported authentication token. Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, or set RELAYER_AUTH_REQUIRED=false for MVP testing.');
   }
 
-  const response = await fetch(`${config.supabaseUrl.replace(/\/$/, '')}/auth/v1/user`, {
+  const response = await fetchWithDeadline(`${config.supabaseUrl.replace(/\/$/, '')}/auth/v1/user`, {
     headers: {
       apikey: config.supabaseServiceRoleKey,
       Authorization: `Bearer ${token}`,
@@ -2047,7 +2047,7 @@ async function sendLowBalanceAlert({ sponsorXlm, distributionAsset, lowXlm, lowA
     lowAsset ? `Distribution USDC balance is ${distributionAsset}` : null,
   ].filter(Boolean);
 
-  await fetch(process.env.ALERT_WEBHOOK_URL, {
+  await fetchWithDeadline(process.env.ALERT_WEBHOOK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -2060,6 +2060,8 @@ async function sendLowBalanceAlert({ sponsorXlm, distributionAsset, lowXlm, lowA
     }),
   });
 }
+
+const { fetchWithDeadline } = require('./fetchDeadline');
 
 const LOW_BALANCE_ALERT_KEY = 'alert:low-balance';
 
